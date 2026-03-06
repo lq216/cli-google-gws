@@ -236,8 +236,14 @@ fn extract_code_from_input(input: &str) -> String {
     input.to_string()
 }
 
-async fn handle_login(args: &[String]) -> Result<(), GwsError> {
-    // Extract --account, -s/--services, and --no-localhost from args
+struct LoginArgs {
+    account_email: Option<String>,
+    services_filter: Option<HashSet<String>>,
+    no_localhost: bool,
+    filtered_args: Vec<String>,
+}
+
+fn parse_login_args(args: &[String]) -> LoginArgs {
     let mut account_email: Option<String> = None;
     let mut services_filter: Option<HashSet<String>> = None;
     let mut no_localhost = false;
@@ -280,6 +286,21 @@ async fn handle_login(args: &[String]) -> Result<(), GwsError> {
         }
         filtered_args.push(args[i].clone());
     }
+
+    LoginArgs {
+        account_email,
+        services_filter,
+        no_localhost,
+        filtered_args,
+    }
+}
+
+async fn handle_login(args: &[String]) -> Result<(), GwsError> {
+    let parsed = parse_login_args(args);
+    let account_email = parsed.account_email;
+    let services_filter = parsed.services_filter;
+    let no_localhost = parsed.no_localhost;
+    let filtered_args = parsed.filtered_args;
 
     // Resolve client_id and client_secret:
     // 1. Env vars (highest priority)
@@ -2256,5 +2277,41 @@ mod tests {
             extract_code_from_input("http://localhost/?error=access_denied"),
             "http://localhost/?error=access_denied"
         );
+    }
+
+    #[test]
+    fn test_parse_login_args_no_localhost() {
+        let args = vec!["--no-localhost".to_string(), "--scopes".to_string(), "drive".to_string()];
+        let parsed = parse_login_args(&args);
+        assert!(parsed.no_localhost);
+        assert_eq!(parsed.filtered_args, vec!["--scopes", "drive"]);
+    }
+
+    #[test]
+    fn test_parse_login_args_account() {
+        let args = vec!["--account".to_string(), "test@example.com".to_string(), "--no-localhost".to_string()];
+        let parsed = parse_login_args(&args);
+        assert_eq!(parsed.account_email.unwrap(), "test@example.com");
+        assert!(parsed.no_localhost);
+        assert!(parsed.filtered_args.is_empty());
+
+        let args2 = vec!["--account=test2@example.com".to_string()];
+        let parsed2 = parse_login_args(&args2);
+        assert_eq!(parsed2.account_email.unwrap(), "test2@example.com");
+    }
+
+    #[test]
+    fn test_parse_login_args_services() {
+        let args = vec!["-s".to_string(), "drive,gmail".to_string()];
+        let parsed = parse_login_args(&args);
+        let filter = parsed.services_filter.unwrap();
+        assert!(filter.contains("drive"));
+        assert!(filter.contains("gmail"));
+        assert!(!parsed.no_localhost);
+
+        let args2 = vec!["--services=sheets".to_string()];
+        let parsed2 = parse_login_args(&args2);
+        let filter2 = parsed2.services_filter.unwrap();
+        assert!(filter2.contains("sheets"));
     }
 }
