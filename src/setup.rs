@@ -244,6 +244,7 @@ pub struct DiscoveredScope {
     /// Short label, e.g. "drive"
     pub short: String,
     /// Human-readable description from the Discovery Document.
+    #[allow(dead_code)]
     pub description: String,
     /// Which API this scope came from, e.g. "Google Drive"
     #[allow(dead_code)]

@@ -698,17 +698,17 @@ fn is_recommended_scope(
     }
 }
 
-/// Run the rich discovery-based scope picker with templates.
+/// Run the rich discovery-based scope picker with service-first UX.
+///
+/// Instead of showing raw scope names, presents services by name with descriptions
+/// (e.g., "Drive — Manage files, folders, and shared drives") and lets users
+/// select services, then resolve to the appropriate scopes.
 fn run_discovery_scope_picker(
     relevant_scopes: &[crate::setup::DiscoveredScope],
     services_filter: Option<&HashSet<String>>,
 ) -> Option<Vec<String>> {
     use crate::setup::{ScopeClassification, PLATFORM_SCOPE};
     use crate::setup_tui::{PickerResult, SelectItem};
-
-    let mut recommended_scopes = vec![];
-    let mut readonly_scopes = vec![];
-    let mut all_scopes = vec![];
 
     // Pre-filter scopes by services if a filter is specified
     let filtered_scopes: Vec<&crate::setup::DiscoveredScope> = relevant_scopes
@@ -720,109 +720,142 @@ fn run_discovery_scope_picker(
         })
         .collect();
 
-    // Collect all short names for hierarchical dedup of Full Access template
+    // Group scopes by service prefix (first segment of the short name).
+    // e.g., "drive", "drive.metadata.readonly", "drive.file" → all under "drive"
+    let mut service_groups: std::collections::BTreeMap<
+        String,
+        Vec<&crate::setup::DiscoveredScope>,
+    > = std::collections::BTreeMap::new();
+
+    for entry in &filtered_scopes {
+        if is_app_only_scope(&entry.url) {
+            continue;
+        }
+        let service_key = entry.short.split('.').next().unwrap_or(&entry.short);
+        service_groups
+            .entry(service_key.to_string())
+            .or_default()
+            .push(entry);
+    }
+
+    // Build templates: collect scope short names per template category
     let all_shorts: Vec<&str> = filtered_scopes
         .iter()
         .filter(|e| !is_app_only_scope(&e.url))
         .map(|e| e.short.as_str())
         .collect();
 
-    for entry in &filtered_scopes {
-        // Skip app-only scopes that can't be used with user OAuth
-        if is_app_only_scope(&entry.url) {
-            continue;
+    let mut recommended_services = vec![];
+    let mut readonly_services = vec![];
+    let mut all_services = vec![];
+
+    for (svc_key, _scopes) in &service_groups {
+        // A service is "recommended" if any of its scopes are recommended
+        let has_recommended = _scopes
+            .iter()
+            .any(|s| is_recommended_scope(s, &all_shorts, services_filter.is_some()));
+        if has_recommended {
+            recommended_services.push(svc_key.clone());
         }
 
-        if is_recommended_scope(entry, &all_shorts, services_filter.is_some()) {
-            recommended_scopes.push(entry.short.to_string());
+        // A service has readonly scopes
+        let has_readonly = _scopes.iter().any(|s| s.is_readonly);
+        if has_readonly {
+            readonly_services.push(svc_key.clone());
         }
-        if entry.is_readonly {
-            readonly_scopes.push(entry.short.to_string());
-        }
-        // For "Full Access": skip if a broader scope exists (hierarchical dedup)
-        // e.g. "drive.metadata" is subsumed by "drive", "calendar.events" by "calendar"
-        if !is_subsumed_scope(&entry.short, &all_shorts) {
-            all_scopes.push(entry.short.to_string());
-        }
+
+        all_services.push(svc_key.clone());
     }
 
     let mut items: Vec<SelectItem> = vec![
         SelectItem {
-            label: "✨ Recommended (Core Consumer Scopes)".to_string(),
-            description: "Selects Drive, Gmail, Calendar, Docs, Sheets, Slides, and Tasks"
+            label: "✨ Recommended".to_string(),
+            description: "Core consumer APIs: Drive, Gmail, Calendar, Docs, Sheets, Slides, Tasks"
                 .to_string(),
             selected: true,
             is_fixed: false,
             is_template: true,
-            template_selects: recommended_scopes,
+            template_selects: recommended_services.clone(),
         },
         SelectItem {
             label: "🔒 Read Only".to_string(),
-            description: "Selects only readonly scopes for enabled APIs".to_string(),
+            description: "Read-only access to all enabled APIs".to_string(),
             selected: false,
             is_fixed: false,
             is_template: true,
-            template_selects: readonly_scopes,
+            template_selects: readonly_services.clone(),
         },
         SelectItem {
-            label: "⚠️ Full Access (All Scopes)".to_string(),
-            description: "Selects ALL scopes, including restricted write scopes".to_string(),
+            label: "⚠️ Full Access".to_string(),
+            description: "Full read/write access to ALL enabled APIs".to_string(),
             selected: false,
             is_fixed: false,
             is_template: true,
-            template_selects: all_scopes,
+            template_selects: all_services.clone(),
         },
     ];
     let template_count = items.len();
 
-    let mut valid_scope_indices: Vec<usize> = Vec::new();
-    for (idx, entry) in filtered_scopes.iter().enumerate() {
-        // Skip app-only scopes from the picker entirely
-        if is_app_only_scope(&entry.url) {
-            continue;
+    // Add service items with human-readable labels
+    let mut service_keys_in_order: Vec<String> = Vec::new();
+    for (svc_key, scopes) in &service_groups {
+        // Look up service description from registry
+        let svc_entry = crate::services::SERVICES
+            .iter()
+            .find(|e| e.aliases.contains(&svc_key.as_str()));
+        let description = svc_entry.map(|e| e.description).unwrap_or("Google API");
+
+        // Count scope types for the description
+        let total = scopes.len();
+        let restricted_count = scopes
+            .iter()
+            .filter(|s| s.classification == ScopeClassification::Restricted)
+            .count();
+        let sensitive_count = scopes
+            .iter()
+            .filter(|s| s.classification == ScopeClassification::Sensitive)
+            .count();
+
+        let mut badges = Vec::new();
+        if restricted_count > 0 {
+            badges.push(format!("⛔ {restricted_count} restricted"));
+        }
+        if sensitive_count > 0 {
+            badges.push(format!("⚠️  {sensitive_count} sensitive"));
         }
 
-        let (prefix, emoji) = match entry.classification {
-            ScopeClassification::Restricted => ("RESTRICTED ", "⛔ "),
-            ScopeClassification::Sensitive => ("SENSITIVE ", "⚠️  "),
-            ScopeClassification::NonSensitive => ("", ""),
-        };
+        let label = svc_entry
+            .map(|e| {
+                // Capitalize the first alias for display
+                let name = e.aliases[0];
+                let mut chars = name.chars();
+                match chars.next() {
+                    None => String::new(),
+                    Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+                }
+            })
+            .unwrap_or_else(|| svc_key.clone());
 
-        let desc_str = if entry.description.is_empty() {
-            entry.url.clone()
-        } else {
-            entry.description.clone()
-        };
+        let desc_parts: Vec<String> = std::iter::once(description.to_string())
+            .chain(std::iter::once(format!("{total} scopes")))
+            .chain(badges)
+            .collect();
 
-        let description = if prefix.is_empty() {
-            desc_str
-        } else {
-            format!("{}{}{}", emoji, prefix, desc_str)
-        };
-
-        let is_recommended = if entry.is_readonly {
-            let superset = entry.url.strip_suffix(".readonly").unwrap_or(&entry.url);
-            let superset_is_recommended = filtered_scopes
-                .iter()
-                .any(|s| s.url == superset && s.classification != ScopeClassification::Restricted);
-            !superset_is_recommended
-        } else {
-            entry.classification != ScopeClassification::Restricted
-        };
+        let is_recommended = recommended_services.contains(svc_key);
 
         items.push(SelectItem {
-            label: entry.short.to_string(),
-            description,
+            label,
+            description: desc_parts.join(" · "),
             selected: is_recommended,
             is_fixed: false,
             is_template: false,
             template_selects: vec![],
         });
-        valid_scope_indices.push(idx);
+        service_keys_in_order.push(svc_key.clone());
     }
 
     match crate::setup_tui::run_picker(
-        "Select OAuth scopes",
+        "Select services to authorize",
         "Space to toggle, Enter to confirm",
         items,
         true,
@@ -832,43 +865,53 @@ fn run_discovery_scope_picker(
             let readonly = items.get(1).is_some_and(|i| i.selected);
             let full = items.get(2).is_some_and(|i| i.selected);
 
-            let mut selected: Vec<String> = Vec::new();
-
-            if full && !recommended && !readonly {
-                // Full Access: include all non-app-only scopes
-                // (hierarchical dedup is applied in post-processing below)
-                for entry in &filtered_scopes {
-                    if is_app_only_scope(&entry.url) {
-                        continue;
-                    }
-                    selected.push(entry.url.to_string());
-                }
+            // Determine which services are selected
+            let selected_service_keys: Vec<&str> = if full && !recommended && !readonly {
+                all_services.iter().map(|s| s.as_str()).collect()
             } else if recommended && !full && !readonly {
-                // Recommended: consumer scopes only (or top-level scopes if filtered).
-                for entry in &filtered_scopes {
-                    if is_app_only_scope(&entry.url) {
-                        continue;
-                    }
-                    if is_recommended_scope(entry, &all_shorts, services_filter.is_some()) {
-                        selected.push(entry.url.to_string());
-                    }
-                }
+                recommended_services.iter().map(|s| s.as_str()).collect()
             } else if readonly && !full && !recommended {
-                for entry in &filtered_scopes {
-                    if is_app_only_scope(&entry.url) {
-                        continue;
-                    }
-                    if entry.is_readonly {
-                        selected.push(entry.url.to_string());
-                    }
-                }
+                readonly_services.iter().map(|s| s.as_str()).collect()
             } else {
-                for (i, item) in items.iter().enumerate().skip(template_count) {
-                    if item.selected {
-                        let picker_idx = i - template_count;
-                        if let Some(&scope_idx) = valid_scope_indices.get(picker_idx) {
-                            if let Some(entry) = filtered_scopes.get(scope_idx) {
-                                selected.push(entry.url.to_string());
+                // Individual service selection
+                items
+                    .iter()
+                    .enumerate()
+                    .skip(template_count)
+                    .filter(|(_, item)| item.selected)
+                    .filter_map(|(i, _)| {
+                        service_keys_in_order
+                            .get(i - template_count)
+                            .map(|s| s.as_str())
+                    })
+                    .collect()
+            };
+
+            // Map selected services to scope URLs
+            let mut selected: Vec<String> = Vec::new();
+            let is_readonly_mode = readonly && !full && !recommended;
+
+            for svc_key in &selected_service_keys {
+                if let Some(scopes) = service_groups.get(*svc_key) {
+                    if is_readonly_mode {
+                        // In Read Only mode, prefer readonly scopes
+                        for s in scopes {
+                            if s.is_readonly {
+                                selected.push(s.url.clone());
+                            }
+                        }
+                    } else if recommended && !full {
+                        // In Recommended mode, use recommended scope selection logic
+                        for s in scopes {
+                            if is_recommended_scope(s, &all_shorts, services_filter.is_some()) {
+                                selected.push(s.url.clone());
+                            }
+                        }
+                    } else {
+                        // Full or custom: include top-level (non-subsumed) scopes
+                        for s in scopes {
+                            if !is_subsumed_scope(&s.short, &all_shorts) {
+                                selected.push(s.url.clone());
                             }
                         }
                     }
@@ -880,9 +923,7 @@ fn run_discovery_scope_picker(
                 selected.push(PLATFORM_SCOPE.to_string());
             }
 
-            // Hierarchical dedup: if we have both a broad scope (e.g. `.../auth/drive`)
-            // and a narrower scope (e.g. `.../auth/drive.metadata`, `.../auth/drive.readonly`),
-            // drop the narrower one since the broad scope subsumes it.
+            // Hierarchical dedup
             let prefix = "https://www.googleapis.com/auth/";
             let shorts: Vec<&str> = selected
                 .iter()
@@ -892,8 +933,6 @@ fn run_discovery_scope_picker(
             let mut deduplicated: Vec<String> = Vec::new();
             for scope in &selected {
                 if let Some(short) = scope.strip_prefix(prefix) {
-                    // Check if any OTHER selected scope is a prefix of this one
-                    // e.g. "drive" is a prefix of "drive.metadata" → drop "drive.metadata"
                     let is_subsumed = shorts.iter().any(|&other| {
                         other != short
                             && short.starts_with(other)
