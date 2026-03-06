@@ -715,20 +715,29 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
     }
 
     // Full mode: tool_name encodes service-resource-method (e.g., drive-files-list)
-    let parts: Vec<&str> = tool_name.split('-').collect();
-    if parts.len() < 3 {
+    // Find the enabled service that is a prefix of the tool name.
+    // This correctly handles hyphenated aliases like "admin-reports".
+    let (svc_alias, rest) = config
+        .services
+        .iter()
+        .find_map(|s| {
+            tool_name
+                .strip_prefix(s.as_str())
+                .and_then(|r| r.strip_prefix('-'))
+                .map(|remainder| (s.as_str(), remainder))
+        })
+        .ok_or_else(|| {
+            GwsError::Validation(format!(
+                "Could not determine service from tool name '{}'. No enabled service is a prefix.",
+                tool_name
+            ))
+        })?;
+
+    let parts: Vec<&str> = rest.split('-').collect();
+    if parts.is_empty() {
         return Err(GwsError::Validation(format!(
             "Invalid API tool name: {}",
             tool_name
-        )));
-    }
-
-    let svc_alias = parts[0];
-
-    if !config.services.contains(&svc_alias.to_string()) {
-        return Err(GwsError::Validation(format!(
-            "Service '{}' is not enabled in this MCP session",
-            svc_alias
         )));
     }
 
@@ -739,8 +748,8 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
     let mut current_resources = &doc.resources;
     let mut current_res = None;
 
-    // Walk: ["drive", "files", "list"] — iterate resource path segments between service and method
-    for res_name in &parts[1..parts.len() - 1] {
+    // Walk resource path segments: everything except the last part (which is the method)
+    for res_name in &parts[..parts.len() - 1] {
         if let Some(res) = current_resources.get(*res_name) {
             current_res = Some(res);
             current_resources = &res.resources;
